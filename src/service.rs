@@ -1,8 +1,7 @@
 use std::{io::Cursor, sync::Arc};
 use crate::{Error, PageImageFormat};
-
 use super::error;
-use futures::{future::join_all, stream::{self, FuturesOrdered}, Stream, StreamExt};
+use futures::{stream::FuturesOrdered, StreamExt};
 use image::{DynamicImage, GrayImage, ImageFormat, RgbImage, RgbaImage};
 use logger::error;
 use tokio::runtime::Handle;
@@ -300,15 +299,14 @@ mod async_tests
     async fn test_async_render()
     {
         let _ = logger::StructLogger::new_default();
-        let path = "/home/phobos/Документы/ПОЧТА 14 04.04.2025 (отсортировано)/598-ПП.pdf";
+        let path = "/home/phobos/Документы/Rust Language Cheat Sheet.pdf";
         let service = super::PdfService::new(path, 600, 800);
-        debug!("main: {:?}", std::thread::current().id());
         let now = std::time::Instant::now();
-        let futures: Vec<_> = (1..=5).map(|i| service.convert_page(i, PageImageFormat::Jpeg)).collect();
-        let r = join_all(futures).await;
-        let lenghts = r.iter().map(|f| f.as_ref().unwrap().len()).collect::<Vec<usize>>();
+        let futures: Vec<_> = (1..=29).map(|i| service.convert_page(i, PageImageFormat::Webp)).collect();
+        let _ = join_all(futures).await;
+        //let lenghts = r.iter().map(|f| f.as_ref().unwrap().len()).collect::<Vec<usize>>();
         //assert_eq!(&lenghts, &[194944, 230068, 227336, 229548, 243152, 240192, 227376, 244440, 223816, 213632, 219396, 251056, 249396, 231444, 240676, 251600, 274848, 245200, 216220]);
-        debug!("Тестирование завершено за {}мc -> lenghts: {:?}",  now.elapsed().as_millis(), &lenghts);
+        debug!("Тестирование завершено за {}мc",  now.elapsed().as_millis());
     }
     #[tokio::test]
     async fn test_async_render_one()
@@ -319,7 +317,7 @@ mod async_tests
         debug!("main: {:?}", std::thread::current().id());
         let now = std::time::Instant::now();
         let page = service.convert_page(1, PageImageFormat::Webp).await.unwrap();
-        tokio::fs::write("page.webp", &page).await;
+        let _ = tokio::fs::write("page.webp", &page).await;
         debug!("Тестирование завершено за {}мc",  now.elapsed().as_millis());
     }
     #[tokio::test]
