@@ -1,11 +1,11 @@
 use std::{io::Cursor, sync::Arc};
-use crate::Error;
+use crate::{Error, PageImageFormat};
 
 use super::error;
-use image::{GrayImage, ImageFormat, RgbaImage, DynamicImage};
+use futures::{future::join_all, stream::{self, FuturesOrdered}, Stream, StreamExt};
+use image::{DynamicImage, GrayImage, ImageFormat, RgbImage, RgbaImage};
 use logger::error;
 use tokio::runtime::Handle;
-use utilites::Hasher;
 use pdfium_render::prelude::{PdfBitmapFormat, PdfPageRenderRotation, PdfRenderConfig, Pdfium};
 //use pdfium_render::prelude::*;
 pub struct PdfService 
@@ -25,12 +25,11 @@ impl PdfService
     }
     fn get_instance() -> Result<Pdfium, error::Error> 
     {
-        let dirs = ["libs/pdf/libs/", "pdf/libs/", "./libs/", "libs/"];
+        let dirs = ["./libs/", "libs/"];
         let binding_result = 
         Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(dirs[0]))
         .or_else(|_| Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(dirs[1])))
-        .or_else(|_| Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(dirs[2])))
-        .or_else(|_| Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(dirs[3])));
+        .or_else(|_| Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(dirs[1])));
         if let Ok(result) = binding_result
         {
             return Ok(Pdfium::new(result));
@@ -45,90 +44,104 @@ impl PdfService
     }
     
     ///Извлечение изображения из pdf и выдача в формате строки base64
-    pub async fn convert_pdf_page_to_image(&self, page_number: u32) -> Result<String, error::Error> 
+    pub async fn convert_page(&self, page_number: u32, image_format: PageImageFormat) -> Result<Vec<u8>, error::Error> 
     {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let config = Arc::clone(&self.config);
         let path = self.path.clone();
         let path2 = path.clone();
-        let current = Handle::current();
-        tokio::task::spawn_blocking(move || 
+        tokio::task::spawn_blocking(move ||
         {
-            current.block_on(
-            async move
+            let pdfium = Self::get_instance();
+            if pdfium.is_err()
             {
-                let pdfium = Self::get_instance();
-                if pdfium.is_err()
+                let _ = sender.send(Err(pdfium.err().unwrap()));
+                return;
+            }
+            let pdfium = pdfium.unwrap();
+            let document = pdfium.load_pdf_from_file(&path, None);
+            if document.is_err()
+            {
+                let _ = sender.send(Err(error::Error::PdfiumError(document.err().unwrap())));
+                return;
+            }
+            let document = document.unwrap();
+            let pages_count = document.pages().len();
+            if page_number < 1 || page_number > pages_count as u32
+            {
+                let _ = sender.send(Err(error::Error::WrongPageSelect(path.clone(), pages_count as u32, page_number)));
+                return;
+            }
+            let page_index = (page_number -1) as usize;
+            let page = document.pages().iter().nth(page_index).unwrap();
+            let current_page =  page.render_with_config(&config);
+            if current_page.is_err()
+            {
+                let _ = sender.send(Err(error::Error::PdfiumError(current_page.err().unwrap())));
+                return;
+            }
+            let current_page = current_page.unwrap();
+            let bytes = current_page.as_rgba_bytes();
+            let width = current_page.width() as u32;
+            let height = current_page.height() as u32;
+            let image = match current_page.format().unwrap_or_default() 
+            {
+                PdfBitmapFormat::Gray => 
                 {
-                    let _ = sender.send(Err(pdfium.err().unwrap()));
-                    return;
+                    GrayImage::from_raw(width, height, bytes).map(DynamicImage::ImageLuma8)
                 }
-                let pdfium = pdfium.unwrap();
-                let document = pdfium.load_pdf_from_file(&path, None);
-                if document.is_err()
+                _ => 
                 {
-                    let _ = sender.send(Err(error::Error::PdfiumError(document.err().unwrap())));
-                    return;
-                }
-                let document = document.unwrap();
-                let pages_count = document.pages().len();
-                if page_number < 1 || page_number > pages_count as u32
-                {
-                    let _ = sender.send(Err(error::Error::WrongPageSelect(path.clone(), pages_count as u32, page_number)));
-                    return;
-                }
-                let page_index = (page_number -1) as usize;
-                let page = document.pages().iter().nth(page_index).unwrap();
-                let current_page =  page.render_with_config(&config);
-                if current_page.is_err()
-                {
-                    let _ = sender.send(Err(error::Error::PdfiumError(current_page.err().unwrap())));
-                    return;
-                }
-                let current_page = current_page.unwrap();
-                let bytes = current_page.as_rgba_bytes();
-                let width = current_page.width() as u32;
-                let height = current_page.height() as u32;
-                let image = match current_page.format().unwrap_or_default() 
-                {
-                    PdfBitmapFormat::BGRA
-                    | PdfBitmapFormat::BRGx
-                    | PdfBitmapFormat::BGRx
-                    | PdfBitmapFormat::BGR => 
+                    match &image_format
                     {
-                        RgbaImage::from_raw(width, height, bytes).map(DynamicImage::ImageRgba8)
+                        PageImageFormat::Jpeg =>  RgbImage::from_raw(width, height, bytes).map(DynamicImage::ImageRgb8),
+                        _ => RgbaImage::from_raw(width, height, bytes).map(DynamicImage::ImageRgba8)
                     }
-                    PdfBitmapFormat::Gray => 
-                    {
-                        GrayImage::from_raw(width, height, bytes).map(DynamicImage::ImageLuma8)
-                    }
-                };
-                let _ = sender.send(image.ok_or(Error::ExtractDynamicImageError(path.clone(), page_number)));
-            })
+                }
+            };
+            let _ = sender.send(image.ok_or(Error::ExtractDynamicImageError(path.clone(), page_number)));
         });
 
         if let Ok(page) = receiver.await
         {
             let image = page?;
-            let png = self.convert_page(image, path2, page_number).await?;
-            let base64 = Hasher::from_bytes_to_base64(&png);
-            return Ok(base64);
+            let png = self.gen_image(image, path2, page_number, image_format).await?;
+            return Ok(png);
         }
         else 
         {
             return Err(error::Error::ChannelError(self.path.clone()));
         }
     }
-     ///Извлечение изображения из pdf и выдача в формате строки base64
+
+    pub async fn convert_all_pages(&self, image_format: PageImageFormat) -> Result<impl StreamExt<Item = Result<Vec<u8>, error::Error>>, error::Error>
+    {
+        let pages = self.get_pages_count().await?;
+        let mut ordered = FuturesOrdered::new();
+        for i in 1..=pages
+        {
+            ordered.push_back(Box::pin(self.convert_page(i as u32, image_format)));
+        }
+        //let futures: Vec<_> = (1..=pages).map(|i| Box::pin(self.convert_pdf_page_to_image(i as u32, image_format))).collect();
+        //let stream = stream::iter(futures)
+        //.buffered(2);
+        Ok(ordered)
+    }
+    pub async fn convert_pages(&self, pages: &[u32], image_format: PageImageFormat) -> impl StreamExt<Item = Result<Vec<u8>, error::Error>>
+    {
+        let mut ordered = FuturesOrdered::new();
+        for i in pages
+        {
+            ordered.push_back(Box::pin(self.convert_page(*i, image_format)));
+        }
+        ordered
+    }
+     ///Извлечение изображения из pdf
      pub async fn get_pages_count(&self) -> Result<u16, error::Error> 
      {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let path = self.path.clone();
-        let current = Handle::current();
-        tokio::task::spawn_blocking(move || 
-        {
-            current.block_on(
-            async move
+        tokio::task::spawn_blocking(move ||
             {
                 let pdfium = Self::get_instance();
                 if pdfium.is_err()
@@ -146,9 +159,9 @@ impl PdfService
                 let document = document.unwrap();
                 let pages_count = document.pages().len();
                 let _ = sender.send(Ok(pages_count));
-            })
-        });
-
+            }
+            
+        );
         if let Ok(pages) = receiver.await
         {
             return pages;
@@ -160,7 +173,7 @@ impl PdfService
     }
 
     // Извлечение страницы из pdf и преобразование ее в формат rgba8 pdf и выдача страницы в виде массива байт
-    async fn convert_page(&self, dyn_image: DynamicImage, path: String, page_number: u32) -> Result<Vec<u8>, error::Error>
+    async fn gen_image(&self, dyn_image: DynamicImage, path: String, page_number: u32, image_format: PageImageFormat) -> Result<Vec<u8>, error::Error>
     {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let current = Handle::current();
@@ -169,12 +182,83 @@ impl PdfService
             current.block_on(
             async move
             {
-                let mut writer = std::io::BufWriter::new(Cursor::new(vec![]));
-                let rgba8 = dyn_image.as_rgba8();
-                if let Some(rgba) = rgba8
+                //бферизацию тут не используем, так как с io не работаем
+                let mut buffer = std::io::BufWriter::new(Cursor::new(vec![]));
+                //Изначально изображение в rgba поэтому для rgba берем as_rgba8 для остальных, например jpeg - dyn_image.to_rgb8()
+                let converted = match image_format
                 {
-                    let _ = rgba.write_to(&mut writer, ImageFormat::Png);
-                    let flash = writer.into_inner();
+                    PageImageFormat::Png =>
+                    {
+                        if let Some(rgba8) = dyn_image.as_rgba8()
+                        {
+                            let res = rgba8.write_to(&mut buffer, ImageFormat::Png);
+                            if res.is_err()
+                            {
+                                logger::error!("{}", res.as_ref().err().unwrap());
+                                Err(error::Error::ImageConvertingError(page_number as u32, path.to_owned(), "png".to_owned()))
+                            }
+                            else 
+                            {
+                                Ok(())
+                            }
+                        }
+                        else 
+                        {
+                            logger::error!("Изображение не может быть представлено как rgba8, необходима конвертация");
+                            Err(error::Error::Rgba8ConvertError(path.to_owned(), page_number as u32))
+                        }
+                    }, 
+                    PageImageFormat::Jpeg => 
+                    {
+                        if let Some(rgb) = dyn_image.as_rgb8()
+                        {
+                            let jpeg_quality = 90;
+                            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buffer, jpeg_quality);
+                            let res = rgb.write_with_encoder(encoder);
+                            if res.is_err()
+                            {
+                                logger::error!("{}", res.as_ref().err().unwrap());
+                                Err(error::Error::ImageConvertingError(page_number as u32, path.to_owned(), "jpeg".to_owned()))
+                            }
+                            else 
+                            {
+                                Ok(())
+                            }
+                        }
+                        else 
+                        {
+                            logger::error!("Изображение не может быть представлено как rgb8, необходима конвертация");
+                            Err(error::Error::Rgba8ConvertError(path.to_owned(), page_number as u32))
+                        }
+                        
+                    },
+                    PageImageFormat::Webp => 
+                    {
+                        if let Some(rgba) = dyn_image.as_rgba8()
+                        {
+                            let webp_encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut buffer);
+                            let res = rgba.write_with_encoder(webp_encoder);
+                            if res.is_err()
+                            {
+                                logger::error!("{}", res.as_ref().err().unwrap());
+                                Err(error::Error::ImageConvertingError(page_number as u32, path.to_owned(), "webp".to_owned()))
+                            }
+                            else 
+                            {
+                                Ok(())
+                            }
+                        }
+                        else 
+                        {
+                            logger::error!("Изображение не может быть представлено как rgb8, необходима конвертация");
+                            Err(error::Error::Rgba8ConvertError(path.to_owned(), page_number as u32))
+                        }
+                    }
+                };
+
+                if let Ok(_) = converted
+                {
+                    let flash = buffer.into_inner();
                     if let Ok(f) = flash
                     {
                         let buff = f.into_inner();
@@ -187,7 +271,7 @@ impl PdfService
                 }
                 else 
                 {
-                    let _ = sender.send(Err(error::Error::Rgba8ConvertError(path.to_owned(), page_number as u32)));
+                    let _ = sender.send(Err(converted.err().unwrap()));
                 }
             })
         });
@@ -207,20 +291,74 @@ impl PdfService
 mod async_tests
 {
 
-    use futures::future::join_all;
+    use futures::{future::join_all, StreamExt};
     use logger::debug;
+
+    use crate::PageImageFormat;
+
     #[tokio::test]
     async fn test_async_render()
     {
         let _ = logger::StructLogger::new_default();
-        let path = "/hard/xar/medo_testdata/0/15933154/text0000000000.pdf";
+        let path = "/home/phobos/Документы/ПОЧТА 14 04.04.2025 (отсортировано)/598-ПП.pdf";
         let service = super::PdfService::new(path, 600, 800);
         debug!("main: {:?}", std::thread::current().id());
         let now = std::time::Instant::now();
-        let futures: Vec<_> = (1..20).map(|i| service.convert_pdf_page_to_image(i)).collect();
+        let futures: Vec<_> = (1..=5).map(|i| service.convert_page(i, PageImageFormat::Jpeg)).collect();
         let r = join_all(futures).await;
         let lenghts = r.iter().map(|f| f.as_ref().unwrap().len()).collect::<Vec<usize>>();
-        assert_eq!(&lenghts, &[194944, 230068, 227336, 229548, 243152, 240192, 227376, 244440, 223816, 213632, 219396, 251056, 249396, 231444, 240676, 251600, 274848, 245200, 216220]);
+        //assert_eq!(&lenghts, &[194944, 230068, 227336, 229548, 243152, 240192, 227376, 244440, 223816, 213632, 219396, 251056, 249396, 231444, 240676, 251600, 274848, 245200, 216220]);
         debug!("Тестирование завершено за {}мc -> lenghts: {:?}",  now.elapsed().as_millis(), &lenghts);
+    }
+    #[tokio::test]
+    async fn test_async_render_one()
+    {
+        let _ = logger::StructLogger::new_default();
+        let path = "/home/phobos/Документы/ПОЧТА 14 04.04.2025 (отсортировано)/598-ПП.pdf";
+        let service = super::PdfService::new(path, 600, 800);
+        debug!("main: {:?}", std::thread::current().id());
+        let now = std::time::Instant::now();
+        let page = service.convert_page(1, PageImageFormat::Webp).await.unwrap();
+        tokio::fs::write("page.webp", &page).await;
+        debug!("Тестирование завершено за {}мc",  now.elapsed().as_millis());
+    }
+    #[tokio::test]
+    async fn test_async_render_all()
+    {
+        let _ = logger::StructLogger::new_default();
+        let path = "/home/phobos/Документы/Rust Language Cheat Sheet.pdf";
+        let service = super::PdfService::new(path, 600, 800);
+        let now = std::time::Instant::now();
+        let mut stream = service.convert_all_pages(PageImageFormat::Webp).await.unwrap();
+        while let Some(result) = stream.next().await 
+        {
+            match result 
+            {
+                Ok(val) => debug!("Успех: {}", val.len()),
+                Err(e) => debug!("Ошибка: {}", e),
+            }
+        }
+        //assert_eq!(5, pages.len());
+        debug!("Тестирование завершено за {}мc",  now.elapsed().as_millis());
+    }
+
+    #[tokio::test]
+    async fn test_async_render_pages()
+    {
+        let _ = logger::StructLogger::new_default();
+        let path = "/home/phobos/Документы/Rust Language Cheat Sheet.pdf";
+        let service = super::PdfService::new(path, 600, 800);
+        let now = std::time::Instant::now();
+        let mut stream = service.convert_pages(&[1,5,8,13], PageImageFormat::Webp).await;
+        while let Some(result) = stream.next().await 
+        {
+            match result 
+            {
+                Ok(val) => debug!("Успех: {}", val.len()),
+                Err(e) => debug!("{}", e),
+            }
+        }
+        //assert_eq!(5, pages.len());
+        debug!("Тестирование завершено за {}мc",  now.elapsed().as_millis());
     }
 }

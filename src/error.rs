@@ -20,7 +20,9 @@ pub enum Error
     ExtractDynamicImageError(String, u32),
     //Ошибка если дата и размер копируемого файла не может синхронизироваться больше 2 минут
     #[error("Превышено максимальное количество попыток при попытке копирования файла `{0}`, файл должен успевать копироваться в систему в течении 2 минут")]
-    FileTimeCopyError(String)
+    FileTimeCopyError(String),
+    #[error("Ошибка конвертирование страницы {0} файла {1} в формат {2}")]
+    ImageConvertingError(u32, String, String),
 }
 impl serde::Serialize for Error 
 {

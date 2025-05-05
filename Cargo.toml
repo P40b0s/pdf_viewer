@@ -8,13 +8,15 @@ edition = "2024"
 [dependencies]
 pdfium-render= {version="0.8.31", default-features = false, features = ["pdfium_latest", "thread_safe"]}
 serde="1.0.219"
-once_cell="1.20.2"
-image= {version = "0.25.6", default-features = false, features = ["bmp" ,"jpeg", "png"]}
+once_cell="1.21.3"
+image= {version = "0.25.6", default-features = false, features = ["bmp" ,"jpeg", "png", "webp"]}
 logger = {git = "https://github.com/P40b0s/logger.git"}
-tokio= {version="1.41.1", features = ["test-util", "rt", "macros"]}
-utilites = {git = "https://github.com/P40b0s/help_utilites.git", package = "utilites", features = ["hashing"]}
+tokio= {version="1.44.2", features = ["test-util", "rt", "macros", "fs"]}
+#utilites = {git = "https://github.com/P40b0s/help_utilites.git", package = "utilites", features = ["hashing"]}
 thiserror="2.0.12"
 rand="0.9.1"
-[dev-dependencies]
-tokio-test="0.4.4"
 futures="0.3.31"
+
+
+[dev-dependencies]
+tokio-test= {version ="0.4.4"}
