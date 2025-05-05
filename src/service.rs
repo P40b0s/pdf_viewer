@@ -1,4 +1,4 @@
-use std::{io::Cursor, sync::Arc};
+use std::{io::Cursor, path::{Path, PathBuf}, sync::Arc};
 use crate::{Error, PageImageFormat};
 use super::error;
 use futures::{stream::FuturesOrdered, StreamExt};
@@ -10,16 +10,23 @@ use pdfium_render::prelude::{PdfBitmapFormat, PdfPageRenderRotation, PdfRenderCo
 pub struct PdfService 
 {
     config: Arc<PdfRenderConfig>,
-    path: String,
+    path: PathBuf,
 }
 impl PdfService
 {
-    pub fn new(path: &str, w: i32, h: i32) -> Self
+    fn get_path(&self) -> &str
+    {
+        self.path.to_str().unwrap_or("")
+    }
+    pub fn new<P: AsRef<Path>>(path: P, w: i32, h: i32) -> Self
     {
         Self 
         { 
-            config: Arc::new(PdfRenderConfig::new().set_target_width(w).set_maximum_height(h).rotate_if_landscape(PdfPageRenderRotation::Degrees90, true)),
-            path: path.to_owned()
+            config: Arc::new(PdfRenderConfig::new()
+            .set_target_width(w)
+            .set_maximum_height(h)
+            .rotate_if_landscape(PdfPageRenderRotation::Degrees90, true)),
+            path: path.as_ref().to_owned()
         }
     }
     fn get_instance() -> Result<Pdfium, error::Error> 
@@ -48,7 +55,7 @@ impl PdfService
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let config = Arc::clone(&self.config);
         let path = self.path.clone();
-        let path2 = path.clone();
+        let path_str = self.get_path().to_owned();
         tokio::task::spawn_blocking(move ||
         {
             let pdfium = Self::get_instance();
@@ -68,7 +75,7 @@ impl PdfService
             let pages_count = document.pages().len();
             if page_number < 1 || page_number > pages_count as u32
             {
-                let _ = sender.send(Err(error::Error::WrongPageSelect(path.clone(), pages_count as u32, page_number)));
+                let _ = sender.send(Err(error::Error::WrongPageSelect(path_str, pages_count as u32, page_number)));
                 return;
             }
             let page_index = (page_number -1) as usize;
@@ -98,24 +105,24 @@ impl PdfService
                     }
                 }
             };
-            let _ = sender.send(image.ok_or(Error::ExtractDynamicImageError(path.clone(), page_number)));
+            let _ = sender.send(image.ok_or(Error::ExtractDynamicImageError(path_str, page_number)));
         });
 
         if let Ok(page) = receiver.await
         {
             let image = page?;
-            let png = self.gen_image(image, path2, page_number, image_format).await?;
+            let png = self.gen_image(image, page_number, image_format).await?;
             return Ok(png);
         }
         else 
         {
-            return Err(error::Error::ChannelError(self.path.clone()));
+            return Err(error::Error::ChannelError(self.get_path().to_owned()));
         }
     }
 
     pub async fn convert_all_pages(&self, image_format: PageImageFormat) -> Result<impl StreamExt<Item = Result<Vec<u8>, error::Error>>, error::Error>
     {
-        let pages = self.get_pages_count().await?;
+        let pages = Self::get_pages_count(&self.path).await?;
         let mut ordered = FuturesOrdered::new();
         for i in 1..=pages
         {
@@ -136,10 +143,10 @@ impl PdfService
         ordered
     }
      ///Извлечение изображения из pdf
-     pub async fn get_pages_count(&self) -> Result<u16, error::Error> 
+     pub async fn get_pages_count<P: AsRef<Path>>(path: P) -> Result<u16, error::Error> 
      {
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        let path = self.path.clone();
+        let task_path = path.as_ref().to_owned();
         tokio::task::spawn_blocking(move ||
             {
                 let pdfium = Self::get_instance();
@@ -149,7 +156,7 @@ impl PdfService
                     return;
                 }
                 let pdfium = pdfium.unwrap();
-                let document = pdfium.load_pdf_from_file(&path, None);
+                let document = pdfium.load_pdf_from_file(&task_path, None);
                 if document.is_err()
                 {
                     let _ = sender.send(Err(error::Error::PdfiumError(document.err().unwrap())));
@@ -167,15 +174,16 @@ impl PdfService
         }
         else 
         {
-            return Err(error::Error::ChannelError(self.path.clone()));
+            return Err(error::Error::ChannelError(path.as_ref().to_str().unwrap_or("").to_owned()));
         }
     }
 
     // Извлечение страницы из pdf и преобразование ее в формат rgba8 pdf и выдача страницы в виде массива байт
-    async fn gen_image(&self, dyn_image: DynamicImage, path: String, page_number: u32, image_format: PageImageFormat) -> Result<Vec<u8>, error::Error>
+    async fn gen_image(&self, dyn_image: DynamicImage, page_number: u32, image_format: PageImageFormat) -> Result<Vec<u8>, error::Error>
     {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let current = Handle::current();
+        let path = self.get_path().to_owned();
         tokio::task::spawn_blocking(move || 
         {
             current.block_on(
@@ -194,7 +202,7 @@ impl PdfService
                             if res.is_err()
                             {
                                 logger::error!("{}", res.as_ref().err().unwrap());
-                                Err(error::Error::ImageConvertingError(page_number as u32, path.to_owned(), "png".to_owned()))
+                                Err(error::Error::ImageConvertingError(page_number as u32, path.clone(), "png".to_owned()))
                             }
                             else 
                             {
@@ -204,7 +212,7 @@ impl PdfService
                         else 
                         {
                             logger::error!("Изображение не может быть представлено как rgba8, необходима конвертация");
-                            Err(error::Error::Rgba8ConvertError(path.to_owned(), page_number as u32))
+                            Err(error::Error::Rgba8ConvertError(path.clone(), page_number as u32))
                         }
                     }, 
                     PageImageFormat::Jpeg => 
@@ -217,7 +225,7 @@ impl PdfService
                             if res.is_err()
                             {
                                 logger::error!("{}", res.as_ref().err().unwrap());
-                                Err(error::Error::ImageConvertingError(page_number as u32, path.to_owned(), "jpeg".to_owned()))
+                                Err(error::Error::ImageConvertingError(page_number as u32, path.clone(), "jpeg".to_owned()))
                             }
                             else 
                             {
@@ -227,7 +235,7 @@ impl PdfService
                         else 
                         {
                             logger::error!("Изображение не может быть представлено как rgb8, необходима конвертация");
-                            Err(error::Error::Rgba8ConvertError(path.to_owned(), page_number as u32))
+                            Err(error::Error::Rgba8ConvertError(path.clone(), page_number as u32))
                         }
                         
                     },
@@ -240,7 +248,7 @@ impl PdfService
                             if res.is_err()
                             {
                                 logger::error!("{}", res.as_ref().err().unwrap());
-                                Err(error::Error::ImageConvertingError(page_number as u32, path.to_owned(), "webp".to_owned()))
+                                Err(error::Error::ImageConvertingError(page_number as u32, path.clone(), "webp".to_owned()))
                             }
                             else 
                             {
@@ -250,7 +258,7 @@ impl PdfService
                         else 
                         {
                             logger::error!("Изображение не может быть представлено как rgb8, необходима конвертация");
-                            Err(error::Error::Rgba8ConvertError(path.to_owned(), page_number as u32))
+                            Err(error::Error::Rgba8ConvertError(path.clone(), page_number as u32))
                         }
                     }
                 };
@@ -265,7 +273,7 @@ impl PdfService
                     }
                     else 
                     {
-                        let _ = sender.send(Err(error::Error::WriteBufferError(path.to_owned(), page_number as u32)));
+                        let _ = sender.send(Err(error::Error::WriteBufferError(path.clone(), page_number as u32)));
                     }
                 }
                 else 
@@ -280,7 +288,7 @@ impl PdfService
         }
         else 
         {
-            return Err(error::Error::ChannelError(self.path.clone()));
+            return Err(error::Error::ChannelError(self.get_path().to_owned()));
         }
     }
 }
