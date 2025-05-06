@@ -120,6 +120,100 @@ impl PdfService
         }
     }
 
+    pub async fn convert_pages_test(&self, pages: &[u32], image_format: PageImageFormat) -> Result<Vec<Vec<u8>>, error::Error> 
+    {
+        
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(3);
+        let config = Arc::clone(&self.config);
+        let path = self.path.clone();
+        let path_str = self.get_path().to_owned();
+        let pages_vec = pages.to_vec();
+        let current = Handle::current();
+        if pages.is_empty()
+        {
+            return Err(error::Error::NonePageSelect(path_str));
+        }
+        tokio::task::spawn_blocking(move ||
+        {
+            current.block_on(
+                async move
+                {
+            let pdfium = Self::get_instance();
+            if pdfium.is_err()
+            {
+                let _ = sender.send(Err(pdfium.err().unwrap())).await;
+                return;
+            }
+            let pdfium = pdfium.unwrap();
+            let document = pdfium.load_pdf_from_file(&path, None);
+            if document.is_err()
+            {
+                let _ = sender.send(Err(error::Error::PdfiumError(document.err().unwrap()))).await;
+                return;
+            }
+            let document = document.unwrap();
+            let pages_count = document.pages().len();
+            let min_page = pages_vec.iter().min().unwrap();
+            let max_page = pages_vec.iter().max().unwrap();
+            if min_page < &1 || max_page > &(pages_count as u32)
+            {
+                let _ = sender.send(Err(error::Error::WrongPageSelect(path_str, pages_count as u32, *max_page))).await;
+                return;
+            }
+            for p in pages_vec
+            {
+                let page_index = (p -1) as u16;
+                if let Ok(currrent_page) = document.pages().get(page_index)
+                {
+                    let current_page_bitmap =  currrent_page.render_with_config(&config);
+                    if current_page_bitmap.is_err()
+                    {
+                        let _ = sender.send(Err(error::Error::PdfiumError(current_page_bitmap.err().unwrap()))).await;
+                        return;
+                    }
+                    let current_page_bitmap = current_page_bitmap.unwrap();
+                    let bytes = current_page_bitmap.as_rgba_bytes();
+                    let width = current_page_bitmap.width() as u32;
+                    let height = current_page_bitmap.height() as u32;
+                    let image = match current_page_bitmap.format().unwrap_or_default() 
+                    {
+                        PdfBitmapFormat::Gray => 
+                        {
+                            GrayImage::from_raw(width, height, bytes).map(DynamicImage::ImageLuma8)
+                        }
+                        _ => 
+                        {
+                            match &image_format
+                            {
+                                PageImageFormat::Jpeg =>  RgbImage::from_raw(width, height, bytes).map(DynamicImage::ImageRgb8),
+                                _ => RgbaImage::from_raw(width, height, bytes).map(DynamicImage::ImageRgba8)
+                            }
+                        }
+                    };
+                    if let Some(image) = image
+                    {
+                        let _ = sender.send(Ok((image, p))).await;
+                    }
+                    else 
+                    {
+                        let _ = sender.send(Err(Error::ExtractDynamicImageError(path_str.clone(), p))).await;
+                    }
+                }
+                
+            }
+        })
+        
+        });
+        let mut images_vec = Vec::with_capacity(pages.len());
+        while let Some(page) = receiver.recv().await
+        {
+            let (image, page_number) = page?;
+            let png = self.gen_image(image, page_number, image_format).await?;
+            images_vec.push(png);
+        }
+        Ok(images_vec)
+    }
+
     pub async fn convert_all_pages(&self, image_format: PageImageFormat) -> Result<impl StreamExt<Item = Result<Vec<u8>, error::Error>>, error::Error>
     {
         let pages = Self::get_pages_count(&self.path).await?;
@@ -347,7 +441,7 @@ mod async_tests
         //assert_eq!(5, pages.len());
         debug!("Тестирование завершено за {}мc",  now.elapsed().as_millis());
     }
-
+    //average 330ms
     #[tokio::test]
     async fn test_async_render_pages()
     {
@@ -366,5 +460,19 @@ mod async_tests
         }
         //assert_eq!(5, pages.len());
         debug!("Тестирование завершено за {}мc",  now.elapsed().as_millis());
+    }
+
+    //average 450ms
+    //не так как расчитывалось
+    #[tokio::test]
+    async fn test_async_render_pages_test()
+    {
+        let _ = logger::StructLogger::new_default();
+        let path = "/home/phobos/Документы/Rust Language Cheat Sheet.pdf";
+        let service = super::PdfService::new(path, 600, 800);
+        let now = std::time::Instant::now();
+        let res = service.convert_pages_test(&[1,5,8,13], PageImageFormat::Webp).await;
+        //assert_eq!(5, pages.len());
+        debug!("Тестирование завершено за {}мc -> переконвертировано {}",  now.elapsed().as_millis(), res.unwrap().len());
     }
 }

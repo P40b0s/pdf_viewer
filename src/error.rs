@@ -4,8 +4,10 @@
 #[derive(Debug, thiserror::Error)]
 pub enum Error 
 {
-    #[error("Ошибка, в pdf {0} всего {1} страницы, а выбрана страница {2}")]
+    #[error("Ошибка, в pdf {0} всего {1} страниц, а выбрана страница {2}")]
     WrongPageSelect(String, u32, u32),
+    #[error("Для рендера pdf {0} не выбрано ни одной страницы")]
+    NonePageSelect(String),
     #[error("Ошибка преобразования изображения в формат rgba8, файл: {0} страница {1}")]
     Rgba8ConvertError(String, u32),
     #[error("Ошибка записи в буфер, файл: {0} страница {1}")]
